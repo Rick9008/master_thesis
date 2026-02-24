@@ -8,9 +8,9 @@ def df_init_and_cleanup(nodes, i, Time):
 
     # defaults
     if not hasattr(n, "COLLECTION_WINDOW"):
-        n.COLLECTION_WINDOW = 20.0
+        n.COLLECTION_WINDOW = 800.0
     if not hasattr(n, "DISCOVERY_TIMEOUT"):
-        n.DISCOVERY_TIMEOUT = 200.0
+        n.DISCOVERY_TIMEOUT = 8000.0
 
     # state containers
     if not hasattr(n, "discovery_table"):
@@ -37,6 +37,7 @@ def df_init_and_cleanup(nodes, i, Time):
     # cleanup discovery_table
     for k in list(n.discovery_table.keys()):
         if Time > n.discovery_table[k].get("expires_at", 0):
+            # print(f"[DF CLEANUP] Node {n.ID} removing expired discovery_table entry {k} at time {Time}")
             del n.discovery_table[k]
 
     # cleanup replied markers
@@ -301,6 +302,11 @@ def df_handle_path_reply(nodes, i, received_packet, Advertise_node, Time, BUFFER
 
                 lane_nodes = getattr(received_packet, "lane_nodes", []) or []
                 n.df_lane_nodes.setdefault(target, {})[lane_idx] = list(lane_nodes)
+                
+                # === [Fix] Clear pending state so next lane can be requested immediately ===
+                if hasattr(n, "df_pending") and target in n.df_pending:
+                    del n.df_pending[target]
+
             # 用完就刪，避免同一 transaction 重複處理
             try:
                 del n.discovery_table[dkey]

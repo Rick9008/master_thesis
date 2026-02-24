@@ -32,6 +32,7 @@ from Network_Updater import *
 from destinations import F_destination
 import shutil
 import os
+from initializer import RUN_MODE
 
 #========= [新增]unicast DF-next-hop 功能 ==================
 def apply_df_next_hop(sender_node, pkt):
@@ -62,12 +63,77 @@ def apply_df_next_hop(sender_node, pkt):
         return
     pkt.df_next_hop = nh
 #=====================================================================================
+_TRAFFIC_PLAN = None
+
+def load_traffic_plan():
+    """
+    Load log/<RUN_MODE>/traffic_plan.json (or your TRAFFIC_PLAN_PATH) once and cache it.
+    Returns dict or None.
+    """
+    global _TRAFFIC_PLAN
+    if _TRAFFIC_PLAN is not None:
+        return _TRAFFIC_PLAN
+
+    # 你 initializer 用的那個路徑：TRAFFIC_PLAN_PATH
+    # 如果 event_driven 裡拿不到 TRAFFIC_PLAN_PATH，就用 log/<RUN_MODE>/traffic_plan.json
+    plan_path = os.path.join("log", "traffic_plan.json")
+
+    if not os.path.exists(plan_path):
+        print(f"[PLAN][WARN] traffic_plan not found: {plan_path}")
+        _TRAFFIC_PLAN = None
+        return None
+
+    with open(plan_path, "r", encoding="utf-8") as f:
+        _TRAFFIC_PLAN = json.load(f)
+
+    # 保護：確保有 src_to_dsts
+    if "src_to_dsts" not in _TRAFFIC_PLAN:
+        print(f"[PLAN][WARN] traffic_plan missing src_to_dsts: {plan_path}")
+        _TRAFFIC_PLAN = None
+
+    return _TRAFFIC_PLAN
+
+
+def get_dsts_for_src(i_node: int):
+    """
+    Return fixed dst list for this src from plan; empty list if missing.
+    """
+    plan = load_traffic_plan()
+    if not plan:
+        return []
+    m = plan.get("src_to_dsts", {})
+    dsts = m.get(str(i_node), [])
+    if isinstance(dsts, int):
+        dsts = [dsts]
+    # 只保留 int
+    out = []
+    for d in dsts:
+        try:
+            out.append(int(d))
+        except:
+            pass
+    return out
+
 # ===================== clear result_chart before simulation =====================
 RESULT_DIR = "result_chart"
 if os.path.exists(RESULT_DIR):
     shutil.rmtree(RESULT_DIR)
 os.makedirs(RESULT_DIR, exist_ok=True)
 # ================================================================================
+
+cluster_counts_log = setup_logger("cluster_counts", "cluster_counts.csv")
+cluster_nodes_log  = setup_logger("cluster_nodes",  "cluster_nodes.csv")
+
+cluster_counts_log.info("time,CH,GW,OD,UC,Legacy")
+cluster_nodes_log.info("time,node_id,x,y,role,my_ch_id")
+
+
+CLUSTER_SAMPLE_INTERVAL = 100.0  # ms，你可先用 50 或 100
+next_cluster_sample = 0.0
+
+
+
+
 ##########################################################################
 while True:  # events are executed in order of their time
     if round(Time) >= Show_progress:  # the simulator shows the percentage of simulation progress after
@@ -75,7 +141,7 @@ while True:  # events are executed in order of their time
         print("progress", round((Time/EXECUTION_TIME)*100, 2))
         Show_progress = Show_progress + Show_progress_interval
     if round(Time) >= next_update:  # the simulator calls the Network_Updator module after each update_mobility_interval
-        nodes, Center_node = update_configurations_models(nodes, NUMBER_NODES, nodes[i_node].NODE_RANGE,
+        nodes = update_configurations_models(nodes, NUMBER_NODES, nodes[i_node].NODE_RANGE,
                                                           NUMBER_RELAY_NODE, NUMBER_RELAY_G_NODE, ENVIRONMENT, Gar)
         next_update = next_update + update_mobility_interval
     if Time >= EXECUTION_TIME:  # the end of the simulation that is determined by the EXECUTION_TIME
@@ -90,12 +156,25 @@ while True:  # events are executed in order of their time
             energy_log.info("%s   %s   %s   %s    %s", i_l, nodes[i_l].Scan_Time,
                             nodes[i_l].Switch_Time, nodes[i_l].Transmit_Time, nodes[i_l].Sleep_Time)
         break
+    if Time >= next_cluster_sample:
+        # 1) counts
+        counts = {"CH":0, "GW":0, "OD":0, "UC":0, "Legacy":0}
+        for nd in nodes:
+            r = getattr(nd, "role", "Legacy")
+            counts[r] = counts.get(r, 0) + 1
+        cluster_counts_log.info(f"{Time},{counts['CH']},{counts['GW']},{counts['OD']},{counts['UC']},{counts['Legacy']}")
+
+        # 2) topology snapshot
+        for nd in nodes:
+            r = getattr(nd, "role", "Legacy")
+            cluster_nodes_log.info(f"{Time},{nd.ID},{nd.Xposition},{nd.Yposition},{r},{getattr(nd,'my_ch_id',None)}")
+
+        next_cluster_sample += CLUSTER_SAMPLE_INTERVAL
     #########################################################################
     # in this event, the node generates a heartbeat message and advertises it on channel 37 
     if all_event[i_node][NODE_EVENT] == HEARTBEAT_EVENT_Adv37:
         for il in range(NUMBER_NODES):
             destination.append(il)  # determining the heartbeat message's destination
-        destination.remove(Center_node)
         # destination.remove(nodes[5].LOW_POWER_ID)
         TTL = 127  # the TTL of the heartbeat message is set to 127
         # creating the heartbeat message
@@ -159,92 +238,123 @@ while True:  # events are executed in order of their time
             Time = all_event[i_node][NODE_TIME]
             continue
         # Transmission Interval is used when there are re-transmissions in the generator nodes
-        nodes[i_node].Transmission_Interval = (nodes[i_node].Ntis+1)*10 + random.randint(1, 10)
+        random_backoff = random.randint(1, 10)
+        nodes[i_node].Transmission_Interval = (nodes[i_node].Ntis+1)*10 + random_backoff
+        if getattr(nodes[i_node], "enable_proposed_algo", False) and getattr(nodes[i_node], "role", None) == "UC":
+            if getattr(nodes[i_node], "ch_timer", None) is None:
+                # 用固定 offset（推薦）或用你剛剛 transmission jitter
+                nodes[i_node].ch_timer = Time + random_backoff
         if nodes[i_node].n_count == 0:  # first transmission
-            # in this function, the node's destinations and TTL are determined
-            destination1, data, TTL = F_destination(
-                NUMBER_NODES, Center_node, nodes[i_node].node_TTL,
-                nodes=nodes, src_id=i_node, require_df=True, num_dst=2
-            )
-            # === [新增] DF 判斷邏輯 ===
-            packet_type = 0  # default flooding / non-DF
-            if nodes[i_node].enable_df:
-                target = destination1[0]  # unicast only (destination1 assumed single)
-                # wanted lanes: 優先使用 node.wanted_lanes；沒有就用 node.LANES；再沒有就 1
-                wanted = getattr(nodes[i_node], "wanted_lanes", None)
-                if wanted is None:
-                    wanted = getattr(nodes[i_node], "LANES", 1)
-                # lanes_established: 每個 target 已建立幾條 lane（origin 端狀態）
-                if not hasattr(nodes[i_node], "df_lanes_established"):
-                    nodes[i_node].df_lanes_established = {}
-                established = nodes[i_node].df_lanes_established.get(target, 0)
-                # 規則：
-                # 1) 若 lanes 還沒建滿 -> 先發 PATH_REQUEST 建 lane（即使 forwarding_table 已有也照跑下一輪）
-                # 2) lanes 建滿後 -> 若有 forwarding_table -> 發 DF_DATA；否則退回 PATH_REQUEST
-                if established < wanted:
-                    packet_type = 2  # PATH_REQUEST
-                else:
-                    packet_type = 1 if (target in nodes[i_node].forwarding_table) else 2
-
-                # (選擇性) 如果我是 UC，為了發起請求，我先暫時變成 CH (根據你原本 Algorithm 1)
-                if packet_type == 2 and nodes[i_node].enable_proposed_algo and nodes[i_node].role == "UC":
-                    nodes[i_node].role = "CH"
-            # 建立封包
+            destination_list = list(getattr(nodes[i_node], "fixed_dsts", []))
+            if destination_list:
+                target = int(destination_list[0])   # 一對一：固定唯一 dst
+                destination1 = [target]
+            else:
+                # 保底：沒配到 plan 就退回舊的隨機目的地（避免直接 crash）
+                destination1, data, TTL = F_destination(
+                    NUMBER_NODES=NUMBER_NODES,
+                    NETWORK_TTL=nodes[i_node].node_TTL,
+                    nodes=nodes,
+                    src_id=i_node,
+                    num_dst=1
+                )
+            target = destination1[0]
+            data = random.randint(1, 100)
+            TTL = nodes[i_node].node_TTL
             message_generation = message(TTL, i_node, destination1, data)
-            # 填入判斷結果
-            message_generation.type = packet_type
-            # === DF: PATH_REQUEST 初始化欄位（transaction identity + lane_counter + metric/tracing + avoid_nodes）===
-            # === DF: PATH_REQUEST 初始化欄位（加入 pending，避免同一 target 同時多筆 discovery）===
-            if nodes[i_node].enable_df and message_generation.type == 2:
-                target = destination1[0]
-                wanted = getattr(nodes[i_node], "wanted_lanes", getattr(nodes[i_node], "LANES", 1))
-            
+            # === [新增] Decide packet type (1: DF_DATA, 2: PATH_REQUEST, 3: PATH_REPLY)===
+            packet_type = 0  # default flooding / non-DF
+            if RUN_MODE == "DF" and getattr(nodes[i_node], "enable_df", False):
+                # wanted lanes: 優先使用 node.wanted_lanes；沒有就用 node.LANES；再沒有就 1
                 if not hasattr(nodes[i_node], "df_lanes_established"):
                     nodes[i_node].df_lanes_established = {}
                 if not hasattr(nodes[i_node], "df_lane_nodes"):
                     nodes[i_node].df_lane_nodes = {}
                 if not hasattr(nodes[i_node], "df_pending"):
-                    # target -> {"path_id":..., "lane_idx":..., "avoid_nodes":[...], "expires_at":...}
                     nodes[i_node].df_pending = {}
-            
+                if not hasattr(nodes[i_node], "forwarding_table"):
+                    nodes[i_node].forwarding_table = {}
+
+                wanted = getattr(nodes[i_node], "wanted_lanes", getattr(nodes[i_node], "LANES", 1))
                 established = nodes[i_node].df_lanes_established.get(target, 0)
-                lane_idx = established + 1
-            
-                # --- pending reuse（同 target、同 lane_idx，且未過期 -> 重送同一個 path_id）---
                 pend = nodes[i_node].df_pending.get(target)
                 DISCOVERY_TIMEOUT = getattr(nodes[i_node], "DISCOVERY_TIMEOUT", 2000.0)
-            
-                if pend and pend.get("lane_idx") == lane_idx and Time <= pend.get("expires_at", -1):
-                    pid = pend["path_id"]
-                    avoid = set(pend.get("avoid_nodes", []))
+                if pend and Time > pend.get("expires_at", -1):
+                    # pending expired -> allow restarting discovery
+                    del nodes[i_node].df_pending[target]
+                    pend = None
+                
+                # === [Robustness] clear stale pending if lane already established ===
+                elif pend and pend.get("lane_idx", 999) <= established:
+                     del nodes[i_node].df_pending[target]
+                     pend = None  
+                df_ready = (target in nodes[i_node].forwarding_table) and (established >= wanted)
+                if df_ready:
+                    packet_type = 1 
                 else:
-                    pid = nodes[i_node].new_path_id()
-                    avoid = set()
-                    if lane_idx > 1:
-                        prev_lanes = nodes[i_node].df_lane_nodes.get(target, {})
-                        for li in range(1, lane_idx):
-                            prev_path = prev_lanes.get(li, [])
-                            for nid in prev_path:
-                                avoid.add(nid)
-                        avoid.discard(nodes[i_node].ID)
-                        avoid.discard(target)
-                    nodes[i_node].df_pending[target] = {
-                        "path_id": pid,
-                        "lane_idx": lane_idx,
-                        "avoid_nodes": list(avoid),
-                        "expires_at": Time + DISCOVERY_TIMEOUT
-                    }
+                    # [DEBUG]
+                    if i_node in [13, 33, 57, 65]:
+                         print(f"[DF-DEBUG] Node {i_node} wanting to send to {target}: ready={df_ready} "
+                               f"fw={target in nodes[i_node].forwarding_table} "
+                               f"est={established}/{wanted} pend={pend}")
+                    
+                    # still need to build lanes (or forwarding missing)
+                    if pend is None:
+                        packet_type = 2  # PATH_REQUEST
+                        lane_idx = established + 1  # build next lane
+                        # reuse pending path_id if same lane_idx and not expired
+                        DISCOVERY_TIMEOUT = getattr(nodes[i_node], "DISCOVERY_TIMEOUT", 2000.0)
+                        pend = nodes[i_node].df_pending.get(target)
+                        if pend and pend.get("lane_idx") == lane_idx and Time <= pend.get("expires_at", -1):
+                            pid = pend["path_id"]
+                            avoid = set(pend.get("avoid_nodes", []))
+                        else:
+                            pid = nodes[i_node].new_path_id()
+                            avoid = set()
+                            if lane_idx > 1:
+                                prev_lanes = nodes[i_node].df_lane_nodes.get(target, {})
+                                for li in range(1, lane_idx):
+                                    prev_path = prev_lanes.get(li, [])
+                                    for nid in prev_path:
+                                        avoid.add(nid)
+                                avoid.discard(nodes[i_node].ID)
+                                avoid.discard(target)
+                            nodes[i_node].df_pending[target] = {
+                                "path_id": pid,
+                                "lane_idx": lane_idx,
+                                "avoid_nodes": list(avoid),
+                                "expires_at": Time + DISCOVERY_TIMEOUT
+                            }
+                        message_generation.lane_counter = lane_idx
+                        message_generation.lane_idx = lane_idx
+                        message_generation.path_id = pid
+                        message_generation.pd_origin = nodes[i_node].ID
+                        message_generation.pd_target = target
+                        message_generation.path_metric = 0
+                        message_generation.path_trace = [nodes[i_node].ID]
+                        message_generation.avoid_nodes = list(avoid)
+                    else:
+                        packet_type = 0  # MF_DATA, discovery in progress
+            # === DEBUG: trace DF decision for every data source ===
+            if RUN_MODE == "DF" and getattr(nodes[i_node], "enable_df", False):
+                if packet_type == 2:
+                    print(f"[TX-PATH_REQ] t={round(Time,3)} src={i_node} -> dst={target} "
+                          f"lane_idx={lane_idx} pid={pid} avoid_sz={len(message_generation.avoid_nodes)} "
+                          f"est={established}/{wanted}")
+                elif packet_type == 1:
+                    print(f"[TX-DF_DATA]  t={round(Time,3)} src={i_node} -> dst={target} "
+                          f"est={established}/{wanted} fw={'Y' if target in nodes[i_node].forwarding_table else 'N'}")
+                else:
+                    # packet_type == 0
+                    pend2 = nodes[i_node].df_pending.get(target) if hasattr(nodes[i_node], "df_pending") else None
+                    print(f"[TX-MF_DATA]  t={round(Time,3)} src={i_node} -> dst={target} "
+                          f"est={established}/{wanted} fw={'Y' if target in nodes[i_node].forwarding_table else 'N'} "
+                          f"pend={'Y' if pend2 else 'N'} exp={round(pend2.get('expires_at',-1),3) if pend2 else None}")
             
-                # --- 寫回封包欄位（不論新舊都要重置 metric/trace）---
-                message_generation.lane_counter = lane_idx
-                message_generation.lane_idx = lane_idx
-                message_generation.path_id = pid
-                message_generation.pd_origin = nodes[i_node].ID
-                message_generation.pd_target = target
-                message_generation.path_metric = 0
-                message_generation.path_trace = [nodes[i_node].ID]
-                message_generation.avoid_nodes = list(avoid)
+            # === [新增] Build message ==========================================
+            message_generation.type = packet_type
             # ===================================================================
+            
             #message_generation = message(TTL, i_node, destination1, data)  # creating the main message
             nodes[i_node].Gen_cache.append(message_generation)  # the packet is appended to the generation cache 
             nodes[i_node].message = copy.deepcopy(nodes[i_node].Gen_cache[0])
@@ -266,7 +376,9 @@ while True:  # events are executed in order of their time
                                     message_generation.destination, nodes[i_node].Gen_cache[0].seq_number)
         nodes[i_node].message = copy.deepcopy(nodes[i_node].Gen_cache[0]) 
         # === [新增]DF-unicast：如果是 DF_DATA(type=1)，把 df_next_hop 設好 ===
-        apply_df_next_hop(nodes[i_node], nodes[i_node].message)
+        if RUN_MODE == "DF":
+            apply_df_next_hop(nodes[i_node], nodes[i_node].message)
+        nodes[i_node].message.src_role = getattr(nodes[i_node], "role", "Legacy")
         nodes[i_node].advertising_37(nodes[i_node].message)  # advertising the generated message on channel 37
         nodes[i_node].advertisetag37 = 1
         # logging some information about advertising 
@@ -321,8 +433,10 @@ while True:  # events are executed in order of their time
             # the time of the next packet relaying
         nodes[i_node].message = copy.deepcopy(nodes[i_node].buffer[0])  # the advertising packet is
         # === [新增]DF-unicast：中繼轉送 DF_DATA(type=1) 時只指定下一跳 ===
-        apply_df_next_hop(nodes[i_node], nodes[i_node].message)
+        if RUN_MODE == "DF":
+            apply_df_next_hop(nodes[i_node], nodes[i_node].message)
         # the first packet in the relay node buffer
+        nodes[i_node].message.src_role = getattr(nodes[i_node], "role", "Legacy")
         nodes[i_node].advertising_37(nodes[i_node].message)  # advertising the buffer's packet on channel 37
         if nodes[i_node].message.friend_poll == 0: 
             nodes[i_node].message.TTL -= 1  # decreasing packets' TTL in main and heartbeat messages
@@ -1002,13 +1116,19 @@ plot_and_print_df_paths(nodes, Gar)
 
 import os
 
-os.makedirs("log", exist_ok=True)
-with open("log/collision_stats.csv", "w") as f:
+mode_log_dir = os.path.join("log", RUN_MODE)
+os.makedirs(mode_log_dir, exist_ok=True)
+
+out_path = os.path.join(mode_log_dir, "collision_stats.csv")
+
+with open(out_path, "w") as f:
     f.write("node_id,busy_steps,collision_steps,p_collision\n")
     for n in nodes:
         busy = getattr(n, "busy_steps", 0)
         coll = getattr(n, "collision_steps", 0)
         p = (coll / busy) if busy > 0 else 0.0
         f.write(f"{n.ID},{busy},{coll},{p}\n")
-print("[OUT] wrote log/collision_stats.csv")
+
+print(f"[OUT] wrote {out_path}")
+
 

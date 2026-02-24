@@ -5,12 +5,16 @@
  in the scan functions if the first condition is true the node does the scan event otherwise leaves the function
  the first condition is checked, whether the simulator's current time is increased up to the scan window or not 
 """ 
+from scipy.fft import dst
 from initializer import *
 import random
 import copy
 import df_utils
+import radio_model
 def Scan_function37(nodes, i, all_event, NODE_TIME, NODE_EVENT, reception_ratio, logger, Time):
     if Time < nodes[i].first_time_scan + nodes[i].SCAN_WINDOW:  # this is true until the end of the scan window
+        if nodes[i].enable_proposed_algo:
+            nodes[i].check_ch_timer(Time)
         # ====================== [新增]DF Init / Cleanup / Collection timeout ======================
         df_utils.df_init_and_cleanup(nodes, i, Time)
         df_utils.df_try_send_path_reply_on_timeout(nodes, i, Time, BUFFER_SIZE)
@@ -33,7 +37,17 @@ def Scan_function37(nodes, i, all_event, NODE_TIME, NODE_EVENT, reception_ratio,
             # in the beginning, the quality of the link is checked by the reception ratio matrix
             # if the quality of the link is not enough to receive the packet, the node does not receive the packet
             # and leaves the function 
-            if random.randint(0, 100) > reception_ratio[nodes[i].ID][Advertise_node]:  
+            # if random.randint(0, 100) > reception_ratio[nodes[i].ID][Advertise_node]:
+            pr_dbm = reception_ratio[nodes[i].ID][Advertise_node]  # now it's Pr(dBm)
+            if not radio_model.can_receive_once(
+                    pr_dbm_signal=pr_dbm,
+                    nf_dbm=radio_params["NF_DBM"],
+                    iwlan_dbm=radio_params["IWLAN_DBM"],
+                    ib_mw=0.0,  # 這裡先不算 BLE mesh 干擾（因為 Num_AD_nodes==1）
+                    alpha=radio_params["ALPHA"],
+                    b_bits=radio_params["B_BITS"],
+                    rnd=random
+            ):  
                 nodes[i].cache.remove(nodes[i].cache[len(nodes[i].cache) - 1])
                 all_event[i][NODE_TIME] += SCAN_STEP  # determining the next event time 
                 all_event[i][NODE_EVENT] = SCAN37_C_EVENT  # determining the next event
@@ -43,14 +57,32 @@ def Scan_function37(nodes, i, all_event, NODE_TIME, NODE_EVENT, reception_ratio,
             received_packet = nodes[i].cache[len(nodes[i].cache) - 1]
             link_quality = reception_ratio[nodes[i].ID][Advertise_node]
             pkt_type = getattr(received_packet, "type", None)
+            # --- 分群邏輯 (Clustering) ---
+            if nodes[i].enable_proposed_algo:
+                sender_id = received_packet.source
+                sender_role = getattr(received_packet, 'src_role', 'Legacy')
+                # --- CH demotion support: count downstream OD in my cluster ---
+                if nodes[i].role == "CH":
+                    pkt_ch = getattr(received_packet, "src_ch_id", getattr(received_packet, "my_ch_id", None))
+                    if sender_role == "OD" and pkt_ch == nodes[i].ID:
+                        nodes[i].ch_child_od_in_window += 1
+                nodes[i].on_hear_sender(sender_id, sender_role, Time)
+                nodes[i].update_neighbor_counts(sender_role)
+                nodes[i].run_passive_clustering(Time)
+                nodes[i].calculate_adaptive_duty_cycle()
+            if pkt_type in (0, 1) and nodes[i].ID == 141:
+                print(f"[DBG-141] t={round(Time,3)} got pkt_type={pkt_type} from={received_packet.source} "
+                      f"seq={getattr(received_packet,'seq_number',None)} dst={getattr(received_packet,'destination',None)}")
+
             if pkt_type == 1:
-                is_sink = isinstance(received_packet.destination, list) and (nodes[i].ID in received_packet.destination)
+                dst = received_packet.destination
+                if isinstance(dst, list):
+                    is_sink = nodes[i].ID in dst
+                else:
+                    is_sink = (nodes[i].ID == dst)
                 if is_sink:
                     print(f"[RX-SINK] t={round(Time,3)} sink={nodes[i].ID} got DATA from={received_packet.source} "
-                          f"seq={received_packet.seq_number} gen_t={round(getattr(received_packet,'generation_time',-1),3)}")
-                else:
-                    print(f"[RX] t={round(Time,3)} node={nodes[i].ID} saw DATA for dst={received_packet.destination} "
-                          f"from={received_packet.source} seq={received_packet.seq_number}")
+                          f"seq={received_packet.seq_number} gen_t={round(getattr(received_packet,'generation_time',-1),3)}, 37")
             # ====================== DF common handling (shared by scan37/38/39) ======================
             # (A) DF_DATA selective relaying gate
             handled, ret_time, ret_event = df_utils.df_gate_df_data(
@@ -150,11 +182,49 @@ def Scan_function37(nodes, i, all_event, NODE_TIME, NODE_EVENT, reception_ratio,
                     all_event[i][NODE_EVENT] = SCAN37_C_EVENT
                     nodes[i].Scan_Time += SCAN_STEP
                     return all_event[i][NODE_TIME], all_event[i][NODE_EVENT]
+            # ====================== MF role/group forwarding gate (after seq de-dup, before buffer.append) ======================
+            # only gate "main data" (avoid breaking friend/heartbeat control traffic)
+            if nodes[i].cache[-1].friend_poll == 0 and nodes[i].cache[-1].heartbeat == 0:
+                is_dst = nodes[i].ID in nodes[i].cache[-1].destination
+                if not is_dst:
+                    pkt_ch = getattr(nodes[i].cache[-1], "src_ch_id", None)
+                    if pkt_ch is None:
+                        pass
+                    else:                    
+                        # expire OD's membership if needed
+                        if getattr(nodes[i], "my_ch_id", None) is not None and Time >= getattr(nodes[i], "my_ch_expire", 0):
+                            nodes[i].my_ch_id = None
+                            nodes[i].my_ch_expire = 0.0
+                        if nodes[i].role == "OD":
+                            # OD forwards only its own cluster
+                            if nodes[i].my_ch_id is None or pkt_ch is None or pkt_ch != nodes[i].my_ch_id:
+                                nodes[i].cache.remove(nodes[i].cache[-1])
+                                all_event[i][NODE_TIME] += SCAN_STEP
+                                all_event[i][NODE_EVENT] = SCAN37_C_EVENT
+                                nodes[i].Scan_Time += SCAN_STEP
+                                return all_event[i][NODE_TIME], all_event[i][NODE_EVENT]
+                        elif nodes[i].role == "CH":
+                            # CH forwards only packets tagged to itself
+                            if pkt_ch is None or pkt_ch != nodes[i].ID:
+                                nodes[i].cache.remove(nodes[i].cache[-1])
+                                all_event[i][NODE_TIME] += SCAN_STEP
+                                all_event[i][NODE_EVENT] = SCAN37_C_EVENT
+                                nodes[i].Scan_Time += SCAN_STEP
+                                return all_event[i][NODE_TIME], all_event[i][NODE_EVENT]
+                        elif nodes[i].role == "GW":
+                            # GW forwards everything
+                            pass
+                        else:
+                            # UC / Legacy: follow managed flooding
+                            pass
+            # ===================================================================================================================  
             # this part is done for all kinds of messages
             if nodes[i].cache[len(nodes[i].cache) - 1].friend_poll == 0 or \
                     nodes[i].cache[len(nodes[i].cache) - 1].friend_poll == 1:
                 if len(nodes[i].buffer) < BUFFER_SIZE:  # if the device buffer has enough capacity the message is added
                     # to the device's buffer
+                    if nodes[i].enable_proposed_algo and nodes[i].role == "CH":
+                        nodes[i].ch_fwd_in_window += 1
                     nodes[i].buffer.append(nodes[i].cache[len(nodes[i].cache) - 1])
                     f = nodes[i].ID in nodes[i].buffer[len(nodes[i].buffer) - 1].destination
                     # some data is logged in the relay nodes' log 
