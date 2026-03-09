@@ -70,7 +70,9 @@ LOG_ROOT = os.path.join("log", RUN_MODE)
 os.makedirs(LOG_ROOT, exist_ok=True)
 TRAFFIC_PLAN_PATH = "log/traffic_plan.json"
 ###### deployment setting ###########
-NUMBER_NODES = 150  # the number of nodes in the network
+NUMBER_RELAY_NODE = 145  # number of nodes with relay feature in the network
+NUMBER_RELAY_G_NODE = 5 # number of nodes with relay and generator features in the network
+NUMBER_NODES = NUMBER_RELAY_NODE + NUMBER_RELAY_G_NODE  # the number of nodes in the network
 x = []  # the positions of nodes in the network
 y = []
 
@@ -83,9 +85,6 @@ for i in range(NUMBER_NODES):
     x.append(random.uniform(0, ENVIRONMENT))
     y.append(random.uniform(0, ENVIRONMENT))
 
-
-NUMBER_RELAY_NODE = 145  # number of nodes with relay feature in the network
-NUMBER_RELAY_G_NODE = 5 # number of nodes with relay and generator features in the network
 NODE_RANGE = 10  # the communication range of the nodes, assumin a unit disk model
 EXECUTION_TIME = 100000  # the execution time of the simulator in milliseconds
 #####loging##
